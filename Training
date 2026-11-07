@@ -1,0 +1,161 @@
+"""Reproducible machine-learning workflow for the GSZ atherosclerosis study.
+
+Rename this TXT file to AS_ML_training_script.py before execution.
+Install dependencies listed in requirements.txt, then run:
+    python AS_ML_training_script.py --input AS_training_dataset.xlsx --out ml_results
+For a quick input and fingerprint check without fitting models, run:
+    python AS_ML_training_script.py --input AS_training_dataset.xlsx --out input_check --validate-only
+
+Input columns: Compound, SMILES, Label. Label 1 denotes the assigned positive
+class and Label 0 the assigned negative class. Preserve the supplied row order
+to reproduce the original random split. The script uses the same model grids,
+preprocessing pipelines, seed, and split as the recorded analysis. Probability
+outputs refer to the assigned class. No GitHub repository URL is assumed.
+
+Outputs include fitted pipelines, molecular fingerprints, split assignments,
+cross-validation results, test predictions, metrics, calibration and ROC plots,
+learning curves, and an additional fixed-parameter scaffold-split diagnostic.
+The held-out test set is not used for hyperparameter tuning. No model is
+refitted on all compounds after evaluation.
+"""
+import os
+os.environ.setdefault('MPLCONFIGDIR', os.path.join(os.getenv('TEMP', '.'), 'gsz_matplotlib'))
+for k in ['OMP_NUM_THREADS','OPENBLAS_NUM_THREADS','MKL_NUM_THREADS']:os.environ.setdefault(k,'1')
+import argparse,csv,json,time,hashlib,zipfile,xml.etree.ElementTree as ET,platform,warnings
+from pathlib import Path
+import numpy as np
+import sklearn,rdkit,joblib
+from rdkit import Chem,DataStructs
+from rdkit.Chem import rdFingerprintGenerator
+from rdkit.Chem.Scaffolds import MurckoScaffold
+from sklearn.model_selection import train_test_split,StratifiedKFold,GridSearchCV,GroupShuffleSplit,learning_curve
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier,GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score,f1_score,roc_auc_score,average_precision_score,recall_score,precision_score,matthews_corrcoef,confusion_matrix,roc_curve,precision_recall_curve,brier_score_loss
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from sklearn.calibration import calibration_curve
+
+def read_xlsx(path,sheet=1):
+ ns={'m':'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+ with zipfile.ZipFile(path) as z:
+  shared=[]
+  if 'xl/sharedStrings.xml' in z.namelist():shared=[''.join(x.itertext()) for x in ET.fromstring(z.read('xl/sharedStrings.xml'))]
+  out=[]
+  for row in ET.fromstring(z.read(f'xl/worksheets/sheet{sheet}.xml')).findall('.//m:sheetData/m:row',ns):
+   vals={}
+   for c in row:
+    col=''.join(x for x in c.get('r') if x.isalpha());v=c.find('m:v',ns)
+    text=v.text if v is not None else ''.join(c.itertext())
+    vals[col]=shared[int(text)] if c.get('t')=='s' else text
+   out.append(vals)
+ return out
+
+def dump_csv(path,rows):
+ with open(path,'w',newline='',encoding='utf-8-sig') as f:
+  writer=csv.writer(f);writer.writerows(rows)
+
+def metrics(name,truth,proba,pred,seconds,params):
+ tn,fp,fn,tp=confusion_matrix(truth,pred,labels=[0,1]).ravel()
+ rng=np.random.default_rng(42);aucs=[]
+ for _ in range(1000):
+  ix=rng.integers(0,len(truth),len(truth))
+  if len(np.unique(truth[ix]))==2:aucs.append(roc_auc_score(truth[ix],proba[ix]))
+ return dict(Model=name,Accuracy=float(accuracy_score(truth,pred)),F1=float(f1_score(truth,pred)),F1_weighted=float(f1_score(truth,pred,average='weighted')),ROC_AUC=float(roc_auc_score(truth,proba)),AUC_CI_low=float(np.quantile(aucs,.025)),AUC_CI_high=float(np.quantile(aucs,.975)),PR_AUC_AP=float(average_precision_score(truth,proba)),Sensitivity=float(recall_score(truth,pred)),Specificity=float(tn/(tn+fp)),Precision=float(precision_score(truth,pred,zero_division=0)),MCC=float(matthews_corrcoef(truth,pred)),Brier=float(brier_score_loss(truth,proba)),TN=int(tn),FP=int(fp),FN=int(fn),TP=int(tp),Training_seconds=seconds,Best_params=params)
+
+def main():
+ ap=argparse.ArgumentParser();ap.add_argument('--input',default='AS_training_dataset.xlsx');ap.add_argument('--out',default='ml_results');ap.add_argument('--validate-only',action='store_true',help='Validate the dataset and export fingerprints without fitting models');args=ap.parse_args();out=Path(args.out);out.mkdir(parents=True,exist_ok=True)
+ raw=read_xlsx(args.input);assert [raw[0][k] for k in ['A','B','C']]==['Compound','SMILES','Label']
+ gen=rdFingerprintGenerator.GetMorganGenerator(radius=2,fpSize=1024,includeChirality=False)
+ records=[];bits=[];fps=[];groups=[];seen={};invalid=[]
+ for i,r in enumerate(raw[1:],2):
+  m=Chem.MolFromSmiles(r['B']);label=int(r['C']);assert label in [0,1]
+  if m is None:invalid.append(i);continue
+  key=Chem.MolToInchiKey(m).split('-')[0]
+  if key in seen:raise ValueError('Duplicate structure, check labels: '+str(i))
+  seen[key]=label;fp=gen.GetFingerprint(m);arr=np.zeros(1024,dtype=np.uint8);DataStructs.ConvertToNumpyArray(fp,arr)
+  sc=MurckoScaffold.MurckoScaffoldSmiles(mol=m,includeChirality=False) or 'ACYCLIC'
+  records.append({'Data_row':i,'Compound':r['A'],'SMILES':r['B'],'Label':label,'Scaffold':sc});bits.append(arr);fps.append(fp);groups.append(sc)
+ X=np.asarray(bits,dtype=np.uint8);y=np.array([r['Label'] for r in records]);idx=np.arange(len(y));assert X.shape[1]==1024 and not invalid
+ np.savez_compressed(out/'Morgan_1024.npz',X=X,y=y,compound=np.array([r['Compound'] for r in records]),smiles=np.array([r['SMILES'] for r in records]))
+ dump_csv(out/'Morgan_1024.csv',[['Compound']+[f'Bit_{i}' for i in range(1024)]+['Label']]+[[r['Compound']]+x.tolist()+[r['Label']] for r,x in zip(records,X)])
+ validation={'n_compounds':len(y),'n_positive':int(y.sum()),'n_negative':int((1-y).sum()),'n_features':int(X.shape[1]),'radius':2,'include_chirality':False,'input_sha256':hashlib.sha256(Path(args.input).read_bytes()).hexdigest()}
+ (out/'input_validation.json').write_text(json.dumps(validation,indent=2),encoding='utf-8')
+ if args.validate_only:
+  print('VALIDATION_COMPLETE',json.dumps(validation),flush=True)
+  return
+ train,test=train_test_split(idx,test_size=.2,random_state=42,stratify=y)
+ cv=StratifiedKFold(n_splits=5,shuffle=True,random_state=42)
+ configs={
+ 'RF':(RandomForestClassifier(random_state=42,n_jobs=1),{'model__n_estimators':[50,100,200]}),
+ 'GBoost':(GradientBoostingClassifier(random_state=42),{'model__n_estimators':[50,100,200],'model__learning_rate':[.01,.1,.5]}),
+ 'LR':(LogisticRegression(max_iter=3000,random_state=42),{'model__C':[.1,1,10]}),
+ 'SVM':(SVC(probability=True,random_state=42),{'model__C':[.1,1,10],'model__kernel':['linear','rbf']})}
+ results=[];probs={};cv_summary={};testpred=[['Data_row','Compound','Label']+[n+'_probability_1' for n in configs]+[n+'_prediction' for n in configs]];preds={}
+ for name,(model,grid) in configs.items():
+  print('START',name,flush=True);start=time.time();pipe=Pipeline([('scaler',StandardScaler() if name in ['LR','SVM'] else 'passthrough'),('model',model)])
+  gs=GridSearchCV(pipe,grid,cv=cv,n_jobs=4,scoring='accuracy',return_train_score=True,error_score='raise');gs.fit(X[train],y[train]);elapsed=time.time()-start
+  proba=gs.predict_proba(X[test])[:,1];pred=gs.predict(X[test]);row=metrics(name,y[test],proba,pred,elapsed,gs.best_params_);row['CV_accuracy']=float(gs.best_score_);row['CV_accuracy_std']=float(gs.cv_results_['std_test_score'][gs.best_index_]);results.append(row);probs[name]=proba;preds[name]=pred
+  cv_summary[name]=[{'params':p,'mean_cv_accuracy':float(mean),'std_cv_accuracy':float(std),'mean_train_accuracy':float(tr)} for p,mean,std,tr in zip(gs.cv_results_['params'],gs.cv_results_['mean_test_score'],gs.cv_results_['std_test_score'],gs.cv_results_['mean_train_score'])]
+  joblib.dump(gs.best_estimator_,out/(name+'_random_split.joblib'));(out/'metrics.json').write_text(json.dumps(results,indent=2),encoding='utf-8');print('DONE',name,json.dumps(row),flush=True)
+ for j,i in enumerate(test):testpred.append([records[i]['Data_row'],records[i]['Compound'],int(y[i])]+[float(probs[n][j]) for n in configs]+[int(preds[n][j]) for n in configs])
+ dump_csv(out/'test_predictions.csv',testpred)
+ # Independent fixed-parameter scaffold diagnostic; no test-set model selection.
+ choices=list(GroupShuffleSplit(n_splits=200,test_size=.2,random_state=42).split(X,y,groups))
+ st,su=min(choices,key=lambda pair:abs(len(pair[1])/len(y)-.2)+abs(float(y[pair[1]].mean())-.5))
+ assert not set(np.array(groups)[st])&set(np.array(groups)[su])
+ start=time.time();rf=RandomForestClassifier(n_estimators=200,random_state=42,n_jobs=4);rf.fit(X[st],y[st]);sp=rf.predict_proba(X[su])[:,1];sd=rf.predict(X[su]);scmetrics=metrics('RF_scaffold_fixed200',y[su],sp,sd,time.time()-start,{'n_estimators':200,'random_state':42});joblib.dump(rf,out/'RF_scaffold_split.joblib')
+ (out/'scaffold_metrics.json').write_text(json.dumps(scmetrics,indent=2),encoding='utf-8')
+ dump_csv(out/'scaffold_test_predictions.csv',[['Data_row','Compound','Label','RF_probability_1','RF_prediction']]+[[records[i]['Data_row'],records[i]['Compound'],int(y[i]),float(sp[j]),int(sd[j])] for j,i in enumerate(su)])
+ trainset=set(train);stset=set(st);dump_csv(out/'split_assignments.csv',[list(records[0])+['Random_split','Scaffold_split']]+[list(r.values())+['train' if i in trainset else 'test','train' if i in stset else 'test'] for i,r in enumerate(records)])
+ sim=lambda tr,te:np.array([max(DataStructs.BulkTanimotoSimilarity(fps[i],[fps[j] for j in tr])) for i in te])
+ randomsim=sim(train,test);scsim=sim(st,su)
+ dump_csv(out/'test_similarity.csv',[['Split','Data_row','Max_train_Tanimoto']]+[['random',records[i]['Data_row'],float(v)] for i,v in zip(test,randomsim)]+[['scaffold',records[i]['Data_row'],float(v)] for i,v in zip(su,scsim)])
+ meta={'input_sha256':hashlib.sha256(Path(args.input).read_bytes()).hexdigest(),'n':len(y),'positives':int(sum(y)),'negatives':int(sum(1-y)),'features':1024,'radius':2,'includeChirality':False,'seed':42,'random_train':len(train),'random_test':len(test),'random_test_class_counts':np.bincount(y[test]).tolist(),'scaffold_train':len(st),'scaffold_test':len(su),'scaffold_test_class_counts':np.bincount(y[su]).tolist(),'unique_scaffolds':len(set(groups)),'acyclic_molecules':groups.count('ACYCLIC'),'random_test_fraction_similarity_ge_08':float(np.mean(randomsim>=.8)),'scaffold_test_fraction_similarity_ge_08':float(np.mean(scsim>=.8)),'versions':{'python':platform.python_version(),'numpy':np.__version__,'sklearn':sklearn.__version__,'rdkit':rdkit.__version__},'selection':'Best CV accuracy within training set; test set unused for tuning; scaffold RF fixed a priori at 200 trees.'}
+ (out/'run_metadata.json').write_text(json.dumps(meta,indent=2),encoding='utf-8');(out/'cv_results.json').write_text(json.dumps(cv_summary,indent=2),encoding='utf-8')
+ plt.rcParams.update({'font.weight':'bold','axes.labelweight':'bold','axes.titleweight':'bold','lines.linewidth':3,'font.size':15,'axes.spines.top':False,'axes.spines.right':False})
+ fig,axes=plt.subplots(2,2,figsize=(12,10),layout='constrained')
+ for name in configs:
+  fpr,tpr,_=roc_curve(y[test],probs[name]);auc=next(r['ROC_AUC'] for r in results if r['Model']==name);axes[0,0].plot(fpr,tpr,label=f'{name} AUC={auc:.2f}')
+  pre,rec,_=precision_recall_curve(y[test],probs[name]);axes[0,1].plot(rec,pre,label=name)
+  pt,pp=calibration_curve(y[test],probs[name],n_bins=10,strategy='quantile');axes[1,0].plot(pp,pt,'o-',label=name)
+ axes[0,0].plot([0,1],[0,1],'k--',lw=1);axes[0,0].set(xlabel='False positive rate',ylabel='True positive rate',title='Random holdout ROC');axes[0,0].legend()
+ axes[0,1].axhline(y[test].mean(),ls='--',color='gray');axes[0,1].set(xlabel='Recall',ylabel='Precision',title='Random holdout precision-recall');axes[0,1].legend()
+ axes[1,0].plot([0,1],[0,1],'k--');axes[1,0].set(xlabel='Mean predicted probability',ylabel='Fraction positive',title='Calibration');axes[1,0].legend()
+ axes[1,1].hist(randomsim,bins=np.linspace(0,1,21),alpha=.6,label='Random',density=True);axes[1,1].hist(scsim,bins=np.linspace(0,1,21),alpha=.6,label='Scaffold',density=True);axes[1,1].set(xlabel='Maximum Tanimoto to training set',ylabel='Density',title='Structural similarity of test molecules');axes[1,1].legend()
+ fig.savefig(out/'evaluation.png',dpi=180);fig.savefig(out/'evaluation.pdf');plt.close(fig)
+ fig,axes=plt.subplots(1,4,figsize=(13,3.4),layout='constrained')
+ for ax,name in zip(axes,configs):
+  cm=confusion_matrix(y[test],preds[name]);ax.imshow(cm,cmap='Blues');ax.set(xticks=[0,1],yticks=[0,1],xlabel='Predicted',ylabel='Actual',title=name)
+  for i in range(2):
+   for j in range(2):ax.text(j,i,str(cm[i,j]),ha='center',va='center',color='white' if cm[i,j]>cm.max()/2 else 'black')
+ fig.savefig(out/'confusion_matrices.png',dpi=180);plt.close(fig)
+
+ # Learning curves use only the outer training set and the original five folds.
+ learning=[]
+ fig,ax=plt.subplots(figsize=(10,8),layout='constrained')
+ for name in configs:
+  model=joblib.load(out/(name+'_random_split.joblib'))
+  sizes,tr,va=learning_curve(model,X[train],y[train],train_sizes=np.linspace(.2,1,5),cv=cv,scoring='accuracy',n_jobs=4,shuffle=True,random_state=42,error_score='raise')
+  learning.append({'Model':name,'sizes':sizes.tolist(),'train_mean':tr.mean(1).tolist(),'train_std':tr.std(1).tolist(),'validation_mean':va.mean(1).tolist(),'validation_std':va.std(1).tolist(),'train_folds':tr.tolist(),'validation_folds':va.tolist()})
+  line=ax.plot(sizes,va.mean(1),'--o',label=name+' 5-fold CV')[0]
+  ax.plot(sizes,tr.mean(1),'-o',color=line.get_color(),mfc='white',label=name+' train')
+  ax.fill_between(sizes,va.mean(1)-va.std(1),va.mean(1)+va.std(1),color=line.get_color(),alpha=.10)
+ (out/'learning_curves.json').write_text(json.dumps(learning,indent=2),encoding='utf-8')
+ ax.set(xlabel='Training molecules per fold',ylabel='Accuracy',title='Learning curves')
+ ax.legend(ncol=2,fontsize=10);fig.savefig(out/'learning_curves.png',dpi=200);plt.close(fig)
+ # Absolute error is based on the probability, while class correctness uses P=0.5.
+ fig,axes=plt.subplots(2,2,figsize=(12,10),layout='constrained')
+ for ax,name in zip(axes.ravel(),configs):
+  pr=probs[name];err=np.abs(pr-y[test]);correct=(pr>=.5)==y[test]
+  ax.scatter(pr[correct],err[correct],c='#20836A',s=15,label='Correct at P=0.5')
+  ax.scatter(pr[~correct],err[~correct],c='#CF5264',s=30,marker='x',label='Incorrect at P=0.5')
+  ax.set(xlabel='Predicted P(1)',ylabel='Absolute error',title=name);ax.legend(fontsize=10)
+ fig.savefig(out/'prediction_deviation.png',dpi=200);plt.close(fig)
+
+ print('COMPLETE',json.dumps(meta),flush=True)
+if __name__=='__main__':main()
